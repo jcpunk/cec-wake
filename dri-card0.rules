@@ -1,0 +1,4 @@
+# libcec physical address detection assumes /dev/dri/card0 exists.
+# On systems where the primary GPU enumerates as card1 (common with nvidia),
+# create a compat symlink so libcec finds the correct DRM device.
+SUBSYSTEM=="drm", KERNEL=="card1", SYMLINK+="dri/card0"

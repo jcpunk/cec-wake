@@ -1,0 +1,18 @@
+[Unit]
+Description=HDMI-CEC Wake Controller
+After=graphical-session.target
+ConditionPathExists=/dev/cec
+
+[Service]
+Type=notify
+EnvironmentFile=-%h/.config/cec-wake/cec-wake.conf
+# strip .py following standard behavior
+ExecStart=/usr/libexec/cec_wake_daemon
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+NotifyAccess=main
+WatchdogSec=20
+
+[Install]
+WantedBy=default.target

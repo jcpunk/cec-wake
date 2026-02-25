@@ -1,0 +1,26 @@
+# Symlink /dev/cec -> tty device for USB CEC adapters.
+#
+# Design rationale:
+#   - Match on the tty subsystem so the symlink targets the usable device
+#     node (ttyACM*), not the raw USB device.
+#   - Avoid vendor/serial matching to prevent lock-in to Pulse-Eight
+#     hardware; any CDC-ACM device advertising "CEC" in its product string
+#     will be matched.
+#   - ID_USB_DRIVER==cdc_acm narrows to ACM serial devices only, avoiding
+#     false matches on e.g. USB video devices that mention CEC in metadata.
+#   - TAG+="uaccess" grants seat-local users access via systemd-logind ACL
+#     (replaces legacy GROUP/MODE approaches on systemd hosts).
+#   - MODE="0660" + GROUP="dialout" provides a fallback for non-logind
+#     or headless environments; dialout is the conventional tty group on
+#     RHEL/AlmaLinux.
+#
+# To reload without reboot:
+#   udevadm control --reload && udevadm trigger --subsystem-match=tty
+
+SUBSYSTEM=="tty", \
+    ENV{ID_USB_DRIVER}=="cdc_acm", \
+    ENV{ID_MODEL}=="*CEC*", \
+    SYMLINK+="cec", \
+    MODE="0660", \
+    GROUP="dialout", \
+    TAG+="uaccess"
