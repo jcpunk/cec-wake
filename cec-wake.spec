@@ -11,6 +11,7 @@ BuildRequires:  systemd-rpm-macros
 Requires:       python3
 Requires:       python3-dbus
 Requires:       python3-gobject
+Requires:       python3-pywayland
 Requires:       libcec
 Requires:       systemd
 Requires:       udev
@@ -28,7 +29,7 @@ This package installs:
 %autosetup
 
 %build
-# no build step; script-only package
+# no build step required
 true
 
 %install
@@ -40,7 +41,6 @@ install -D -m 0644 99-cec.rules %{buildroot}/%{_udevrulesdir}/99-cec.rules
 %files
 %license LICENSE
 %doc README.md
-%doc dri-card0.rules
 %doc cec-wake.conf
 %{_libexecdir}/cec_wake_daemon
 %{_userunitdir}/cec-wake.service

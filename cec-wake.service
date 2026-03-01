@@ -5,6 +5,7 @@ ConditionPathExists=/dev/cec
 
 [Service]
 Type=notify
+Environment=WAYLAND_DISPLAY=wayland-0
 EnvironmentFile=-%h/.config/cec-wake/cec-wake.conf
 # strip .py following standard behavior
 ExecStart=/usr/libexec/cec_wake_daemon
