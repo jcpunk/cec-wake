@@ -2,45 +2,91 @@
 """
 cec_wake_daemon.py - HDMI-CEC wake controller for Linux desktops
 
-Listens for display-wake events from complementary sources and sends
-a CEC Active Source command when the screen comes back on:
+Sends a CEC Power-On + Active-Source command when the display comes back on.
 
-  1. Wayland: ext-idle-notify-v1 protocol via python3-pywayland.
-     This is the primary path for KDE 6.x on Wayland, where DPMS-off-only
-     idle (no screen lock) is managed entirely inside KWin with no DBus
-     surface.  The idle notification timeout is auto-detected from
-     ~/.config/powerdevilrc (TurnOffDisplayIdleTimeoutSec minus 5s).
-     --idle-timeout-sec overrides auto-detection when needed.
+Wake event sources
+------------------
+All sources are optional at runtime.  The daemon starts with whatever subset
+is available and logs which sources are active.  All sources share a single
+non-blocking lock so only one cec-client invocation runs at a time.
 
-  2. Session DBus: screensaver ActiveChanged signals (screen lock/unlock).
-     Covers GNOME, Cinnamon, and KDE when the screen is actually locked.
+Wayland sources (python3-pywayland required):
 
-  3. System DBus: org.freedesktop.login1.Session PropertiesChanged on
-     IdleHint (True -> False transition).  Retained as a fallback for
-     non-Wayland sessions or compositors that do report idle to logind.
-     Not used by KDE 6.x on Wayland (IdleHint never transitions).
+  1. ext-idle-notify-v1  (current KDE/Wayland mechanism)
+     Registers an idle notification with a fixed timeout (default 60s, well
+     below any practical screen-off setting).  The compositor fires 'idled'
+     after the configured timeout of continuous user inactivity, then fires
+     'resumed' when activity is detected.  Because the notification resets
+     to active state after each 'resumed' event, spurious wakes during
+     normal use are impossible regardless of how short the timeout is.  The
+     timeout only needs to be shorter than the display power-off setting so
+     that 'idled' fires before the screen goes dark, arming the object for
+     'resumed' on wake.
 
-All sources share a single non-blocking lock so only one cec-client
-invocation runs at a time regardless of which source fires first.
+  2. zwlr-output-power-management-v1  (future-proofing)
+     Emits a 'mode' event directly when display power changes (on/off).
+     Not currently advertised by KWin 6.x, but included so the daemon
+     automatically benefits from it if KDE adds support in a future release.
+     No configuration required; fires on actual DPMS state transitions.
 
-Runtime dependencies:
-    python3-pywayland   - ext-idle-notify-v1 Wayland protocol support
-    python3-dbus        (dbus-python)   - session + system bus subscription
-    python3-gobject     (pygobject3)    - GLib main loop
-    cec-utils                           - provides /usr/bin/cec-client
+DBus sources (python3-dbus + python3-gobject required):
+
+  3. Screensaver ActiveChanged / SessionIdleChanged (session bus)
+     Covers screen lock/unlock wake events on GNOME, Cinnamon, and KDE
+     when the screen locker is active.  Not emitted by KDE 6.x for
+     DPMS-only idle without a lock; the Wayland path handles that case.
+
+  4. logind IdleHint PropertiesChanged (system bus)
+     Fires when the logind session IdleHint transitions True -> False,
+     indicating the session resumed from idle.  Reliable on X11 sessions
+     and compositors that report idle state to logind.  Not used by
+     KDE 6.x on Wayland (IdleHint never transitions in that configuration).
+
+  5. logind PrepareForSleep (system bus)
+     Fires with argument False when the system resumes from suspend.
+     Covers the case where the system suspends during an idle period,
+     bypassing the normal idle -> resume event sequence.
+
+Runtime dependencies
+--------------------
+    python3-pywayland - Wayland protocol bindings (sources 1, 2)
+    python3-dbus      - DBus signal subscription  (sources 3-5)
+    python3-gobject   - GLib main loop for DBus   (sources 3-5)
+    cec-utils         - provides /usr/bin/cec-client
 
 sd_notify is implemented inline; no python3-sdnotify dependency required.
+
+Configuration
+-------------
+All options have corresponding CEC_WAKE_* environment variables so the
+daemon can be configured via an EnvironmentFile without touching the
+service unit.
+
+    # ~/.config/cec-wake/cec-wake.conf
+    CEC_WAKE_HDMI_PORT=3
+    CEC_WAKE_IDLE_TIMEOUT=60
+    CEC_WAKE_OSD_NAME=MyPC
+    CEC_WAKE_DEBUG=0
+    # CEC_WAKE_ADAPTER=/dev/cec
+    # CEC_WAKE_DEVICE_TIMEOUT=120
+    # CEC_WAKE_WAKE_ON_START=0
+    # CEC_WAKE_NO_WAYLAND=0
+    # CEC_WAKE_NO_DBUS=0
+
+systemd unit requirements
+--------------------------
+WAYLAND_DISPLAY is not inherited by user services automatically.  Add:
+    Environment=WAYLAND_DISPLAY=wayland-0
+or set it in the EnvironmentFile.
 
 Logind session path encoding
 -----------------------------
 The logind object path for a session is derived from XDG_SESSION_ID by
-replacing each character that is not [A-Za-z0-9_] with '_' followed by
-its two-hex-digit ASCII value.  For numeric IDs (the common case) this
-yields /org/freedesktop/login1/session/_3<digits> where _3 is the
-encoding of the ASCII digit range (e.g. session "2" -> "_32").
+replacing each character outside [A-Za-z0-9_] with '_' followed by its
+two-hex-digit ASCII value.  For numeric IDs (the common case) this yields
+/org/freedesktop/login1/session/_3<digits> (e.g. session "2" -> "_32").
 """
 
-import configparser
 import logging
 import os
 import signal
@@ -52,26 +98,32 @@ import time
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
 try:
-    import dbus
-    import dbus.mainloop.glib
-except ImportError:
-    print("Please install python3-dbus (dbus-python)", file=sys.stderr)
-    raise
-
-try:
-    from gi.repository import GLib
-except ImportError:
-    print("Please install python3-gobject (pygobject3)", file=sys.stderr)
-    raise
-
-try:
     from pywayland.client import Display as WaylandDisplay
     from pywayland.protocol.ext_idle_notify_v1 import ExtIdleNotifierV1
     from pywayland.protocol.wayland import WlSeat
-
-    HAVE_PYWAYLAND = True
 except ImportError:
-    HAVE_PYWAYLAND = False
+    print("Please install python3-pywayland", file=sys.stderr)
+    raise
+
+# zwlr_output_power_management_unstable_v1 is not yet advertised by KWin 6.x
+# but is included for forward compatibility.  Import failure is non-fatal.
+try:
+    from pywayland.protocol.wlr_output_power_management_unstable_v1 import (
+        ZwlrOutputPowerManagerV1,
+    )
+    HAVE_WLR_OUTPUT_POWER = True
+except ImportError:
+    HAVE_WLR_OUTPUT_POWER = False
+
+# DBus signal support requires python3-dbus and python3-gobject.
+# Non-fatal; daemon operates on Wayland sources alone if unavailable.
+try:
+    import dbus
+    import dbus.mainloop.glib
+    from gi.repository import GLib
+    HAVE_DBUS = True
+except ImportError:
+    HAVE_DBUS = False
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -82,8 +134,22 @@ CEC_CLIENT = "/usr/bin/cec-client"
 CEC_WAKE_CMD = b"on 0\nquit\n"
 CEC_SELECT_CMD = b"as\nquit\n"
 
-# Screensaver DBus interfaces (session bus).
-# Covers lock-based wake events; not used for DPMS-only idle on KDE/Wayland.
+# Seconds between Wayland reconnect attempts after unexpected disconnect.
+WAYLAND_RECONNECT_DELAY_SEC = 5
+
+# zwlr_output_power_management_v1 mode values (from protocol XML).
+WLR_OUTPUT_POWER_MODE_OFF = 0
+WLR_OUTPUT_POWER_MODE_ON = 1
+
+LOG = logging.getLogger("cec-wake")
+
+# ---------------------------------------------------------------------------
+# DBus constants
+# ---------------------------------------------------------------------------
+
+# Screensaver interfaces monitored on the session bus.
+# Covers lock-based wake events across common desktop environments.
+# Not emitted by KDE 6.x for DPMS-only idle; Wayland path handles that case.
 SCREENSAVER_INTERFACES = [
     "org.freedesktop.ScreenSaver",
     "org.kde.screensaver",
@@ -91,14 +157,15 @@ SCREENSAVER_INTERFACES = [
     "org.cinnamon.ScreenSaver",
 ]
 
-LOGIND_BUS_NAME = "org.freedesktop.login1"
-LOGIND_SESSION_IFACE = "org.freedesktop.login1.Session"
-DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+LOGIND_BUS_NAME       = "org.freedesktop.login1"
+LOGIND_MANAGER_PATH   = "/org/freedesktop/login1"
+LOGIND_MANAGER_IFACE  = "org.freedesktop.login1.Manager"
+LOGIND_SESSION_IFACE  = "org.freedesktop.login1.Session"
+DBUS_PROPS_IFACE      = "org.freedesktop.DBus.Properties"
 
-# Wayland event loop reconnect delay on unexpected disconnect.
-WAYLAND_RECONNECT_DELAY_SEC = 5
-
-LOG = logging.getLogger("cec-wake")
+# Resume delay after system suspend to allow display and CEC adapter
+# re-initialisation before sending commands.
+SUSPEND_RESUME_DELAY_SEC = 3
 
 # ---------------------------------------------------------------------------
 # systemd sd_notify (inline; avoids python3-sdnotify dependency)
@@ -109,9 +176,8 @@ def sd_notify(msg: str) -> None:
     """
     Send a sd_notify message to systemd over NOTIFY_SOCKET.
 
-    No-op if NOTIFY_SOCKET is not set (not running under systemd, or
-    NotifyAccess not configured).  Errors are silently ignored; a failed
-    notification is not worth crashing the daemon over.
+    No-op if NOTIFY_SOCKET is not set.  Errors are silently ignored; a
+    failed notification is not worth crashing the daemon over.
     """
     notify_socket = os.getenv("NOTIFY_SOCKET")
     if not notify_socket:
@@ -157,69 +223,8 @@ def wait_for_device(adapter_path: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
-def logind_session_path() -> str:
-    """
-    Return the D-Bus object path for the current logind session.
-
-    Logind encodes the session ID into the path by replacing each character
-    outside [A-Za-z0-9_] with '_' followed by its two-hex-digit ASCII value.
-
-    Raises RuntimeError if XDG_SESSION_ID is not set.
-    """
-    session_id = os.getenv("XDG_SESSION_ID")
-    if not session_id:
-        raise RuntimeError(
-            "XDG_SESSION_ID is not set; logind session monitoring unavailable."
-        )
-
-    encoded = ""
-    for ch in session_id:
-        if ch.isalnum() or ch == "_":
-            encoded += ch
-        else:
-            encoded += f"_{ord(ch):02x}"
-
-    return f"/org/freedesktop/login1/session/{encoded}"
-
-
 # ---------------------------------------------------------------------------
-# KDE power management config
-# ---------------------------------------------------------------------------
-
-
-def kde_screen_off_timeout_sec() -> int | None:
-    """
-    Read the display-off idle timeout from KDE Plasma 6's powerdevilrc.
-
-    Plasma 6 stores power settings in ~/.config/powerdevilrc using a nested
-    section syntax (e.g. [AC][Display]) that configparser reads as a flat
-    key "AC][Display" due to the literal bracket characters in the name.
-
-    Returns the AC profile display-off timeout in seconds, or None if the
-    file or key is absent.  The locked-screen timeout
-    (TurnOffDisplayIdleTimeoutWhenLockedSec) is intentionally ignored; the
-    Wayland idle notification fires regardless of lock state and we want
-    the longer of the two timeouts to ensure idled always fires before
-    the display powers off.
-
-    Falls back gracefully to None so the caller can use --idle-timeout-sec.
-    """
-    config_path = os.path.join(os.getenv("HOME", ""), ".config", "powerdevilrc")
-    if not os.path.exists(config_path):
-        return None
-
-    cfg = configparser.ConfigParser()
-    cfg.read(config_path)
-
-    try:
-        val = cfg.get("AC][Display", "TurnOffDisplayIdleTimeoutSec")
-        return int(val)
-    except (configparser.Error, ValueError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# CEC command
+# CEC commands
 # ---------------------------------------------------------------------------
 
 
@@ -227,9 +232,9 @@ def _run_cec_cmd(cmd: list, cec_input: bytes, label: str) -> bool:
     """
     Run cec-client with the given stdin payload and return True on success.
 
-    Must be called from a worker thread, not the GLib main loop thread.
+    Must be called from a worker thread, not the Wayland event loop thread.
     On timeout the entire process group is SIGKILL'd to release the USB
-    CEC adapter.
+    CEC adapter before returning.
     """
     LOG.info("Sending CEC %s command", label)
     LOG.debug("Command: %s  stdin: %s", cmd, cec_input)
@@ -244,7 +249,9 @@ def _run_cec_cmd(cmd: list, cec_input: bytes, label: str) -> bool:
         try:
             stdout, stderr = proc.communicate(input=cec_input, timeout=10)
         except subprocess.TimeoutExpired:
-            LOG.error("cec-client timed out during %s; killing process group", label)
+            LOG.error(
+                "cec-client timed out during %s; killing process group", label
+            )
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
@@ -273,11 +280,16 @@ def _run_cec_cmd(cmd: list, cec_input: bytes, label: str) -> bool:
 
 def run_cec_wake(hdmi_port: int = 0, osd_name: str = "") -> None:
     """
-    Send Power-On then Active Source CEC commands via cec-client.
+    Send Power-On then Active-Source CEC commands via cec-client.
 
-    Must be called from a dedicated thread, NOT the GLib main loop thread.
-    cec-client can hang inside libcec's USB adapter open path; blocking the
-    main loop prevents GLib.timeout_add watchdog pings from firing.
+    Must be called from a dedicated thread, NOT the Wayland event loop
+    thread.  cec-client can block inside libcec's USB adapter open path;
+    blocking the event loop prevents Wayland keepalives from being sent,
+    which can cause the compositor to drop the connection.
+
+    No explicit adapter path is passed to cec-client; libcec auto-detects
+    the Pulse-Eight USB adapter via USB enumeration.  An explicit path would
+    be treated as a serial port, which fails on USB character devices.
     """
     cmd = [CEC_CLIENT, "-s"]
     if hdmi_port:
@@ -291,7 +303,7 @@ def run_cec_wake(hdmi_port: int = 0, osd_name: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# DBus signal handling
+# Wake dispatcher
 # ---------------------------------------------------------------------------
 
 
@@ -299,9 +311,10 @@ def build_wake_dispatcher(hdmi_port: int = 0, osd_name: str = ""):
     """
     Return a callable that dispatches a CEC wake in a daemon thread.
 
-    A single non-blocking Lock is shared across all signal sources so only
-    one cec-client invocation runs at a time.  Signals arriving while a
-    wake is in flight are silently dropped.
+    A single non-blocking Lock is shared across all Wayland event sources
+    so only one cec-client invocation runs at a time.  Events arriving
+    while a wake is in flight are silently dropped; the in-flight call
+    already sent the command.
     """
     _lock = threading.Lock()
 
@@ -326,228 +339,207 @@ def build_wake_dispatcher(hdmi_port: int = 0, osd_name: str = ""):
     return dispatch
 
 
-def subscribe_screensaver_signals(bus, dispatch) -> list:
-    """
-    Register ActiveChanged and SessionIdleChanged receivers on the session
-    bus for all known screensaver interfaces.
-
-    These cover lock-based and session-idle-based wake events for GNOME,
-    Cinnamon, and KDE in configurations where the screen locker is active.
-    For KDE 6.x DPMS-only idle on Wayland, subscribe_wayland_idle() is
-    the effective path; these registrations are retained as fallbacks.
-    """
-
-    def on_active_changed(is_active, sender_interface=None):
-        LOG.debug("ActiveChanged: is_active=%s iface=%s", is_active, sender_interface)
-        if not is_active:
-            dispatch(sender_interface or "screensaver:ActiveChanged")
-
-    def on_session_idle_changed(is_idle, sender_interface=None):
-        LOG.debug("SessionIdleChanged: is_idle=%s iface=%s", is_idle, sender_interface)
-        if not is_idle:
-            dispatch(sender_interface or "screensaver:SessionIdleChanged")
-
-    for iface in SCREENSAVER_INTERFACES:
-
-        def make_active_handler(captured_iface):
-            def handler(is_active):
-                on_active_changed(is_active, sender_interface=captured_iface)
-
-            return handler
-
-        def make_idle_handler(captured_iface):
-            def handler(is_idle):
-                on_session_idle_changed(is_idle, sender_interface=captured_iface)
-
-            return handler
-
-        bus.add_signal_receiver(
-            make_active_handler(iface),
-            signal_name="ActiveChanged",
-            dbus_interface=iface,
-        )
-        bus.add_signal_receiver(
-            make_idle_handler(iface),
-            signal_name="SessionIdleChanged",
-            dbus_interface=iface,
-        )
-        LOG.debug("Subscribed to %s.ActiveChanged + SessionIdleChanged", iface)
-
-    return SCREENSAVER_INTERFACES
-
-
-def subscribe_logind_idle(system_bus, session_path: str, dispatch) -> None:
-    """
-    Subscribe to logind IdleHint PropertiesChanged on the system bus.
-
-    Retained as a fallback for non-Wayland sessions or compositors that do
-    report idle state to logind.  On KDE 6.x Wayland, IdleHint never
-    transitions (confirmed: IdleSinceHint=0 at all times), so this path
-    is a no-op in practice for that configuration.
-    """
-    _prev_idle = {"value": None}
-
-    def on_properties_changed(iface, changed, invalidated):
-        if iface != LOGIND_SESSION_IFACE:
-            return
-        if "IdleHint" not in changed:
-            return
-        idle_now = bool(changed["IdleHint"])
-        LOG.debug("logind IdleHint: %s -> %s", _prev_idle["value"], idle_now)
-        if _prev_idle["value"] is True and not idle_now:
-            dispatch("logind:IdleHint")
-        _prev_idle["value"] = idle_now
-
-    # Seed the initial state so a restart mid-idle doesn't miss the first
-    # True->False transition after the daemon comes back up.
-    try:
-        obj = system_bus.get_object(LOGIND_BUS_NAME, session_path)
-        props = dbus.Interface(obj, DBUS_PROPS_IFACE)
-        _prev_idle["value"] = bool(props.Get(LOGIND_SESSION_IFACE, "IdleHint"))
-        LOG.debug("Initial logind IdleHint: %s", _prev_idle["value"])
-    except dbus.DBusException as exc:
-        LOG.warning("Could not read initial IdleHint: %s", exc)
-
-    system_bus.add_signal_receiver(
-        on_properties_changed,
-        signal_name="PropertiesChanged",
-        dbus_interface=DBUS_PROPS_IFACE,
-        bus_name=LOGIND_BUS_NAME,
-        path=session_path,
-    )
-    LOG.info("Subscribed to logind IdleHint changes on %s", session_path)
-
-
 # ---------------------------------------------------------------------------
-# Wayland idle monitoring (primary path for KDE 6.x on Wayland)
+# Wayland protocol handlers
 # ---------------------------------------------------------------------------
 
 
-def subscribe_wayland_idle(dispatch, timeout_msec: int) -> None:
+def _setup_idle_notify(globals_, idle_timeout_msec: int, dispatch) -> bool:
     """
-    Subscribe to ext-idle-notify-v1 via python3-pywayland.
+    Bind ext_idle_notifier_v1 and register a notification object.
 
-    This is the only reliable wake signal for KDE 6.x DPMS-off-only idle
-    on Wayland.  KWin manages DPMS entirely inside the compositor; no DBus
-    signal is emitted and logind IdleHint never transitions.
-
-    The ext-idle-notify-v1 protocol requires the client to register an idle
-    timeout.  KWin only fires the 'idled' event (and therefore the 'resumed'
-    event on activity) when the registered timeout <= the compositor's own
-    screen-off timeout.  Set --idle-timeout-sec to a value strictly less
-    than your KDE display power-off setting.
-
-    Runs a persistent event loop in a daemon thread.  On unexpected
-    disconnect (compositor restart, KWin crash), the thread sleeps
-    WAYLAND_RECONNECT_DELAY_SEC and reconnects automatically.
-
-    WAYLAND_DISPLAY must be set in the environment.  systemd user services
-    do not inherit it automatically; add:
-        Environment=WAYLAND_DISPLAY=wayland-0
-    or use an EnvironmentFile that sets it, to the service unit.
+    Returns True if the protocol was available and the notification was
+    registered, False otherwise.
     """
-    if not HAVE_PYWAYLAND:
+    idle_notifier = globals_.get("idle_notifier")
+    seat = globals_.get("seat")
+
+    if not idle_notifier or not seat:
         LOG.warning(
-            "python3-pywayland not available; Wayland idle monitoring disabled. "
-            "Install python3-pywayland to support KDE 6.x DPMS-only idle wake."
+            "ext_idle_notifier_v1 or wl_seat not available from compositor; "
+            "idle-based wake detection disabled"
         )
-        return
+        return False
 
+    notification = idle_notifier.get_idle_notification(idle_timeout_msec, seat)
+
+    def on_idled(notification):
+        LOG.debug("ext-idle-notify: idled")
+
+    def on_resumed(notification):
+        LOG.debug("ext-idle-notify: resumed")
+        dispatch("ext-idle-notify-v1:resumed")
+
+    notification.dispatcher["idled"] = on_idled
+    notification.dispatcher["resumed"] = on_resumed
+
+    LOG.info("Subscribed to ext-idle-notify-v1 (timeout %dms)", idle_timeout_msec)
+    return True
+
+
+def _setup_output_power(globals_, dispatch) -> bool:
+    """
+    Bind zwlr_output_power_manager_v1 and register mode handlers for all
+    current outputs.
+
+    Returns True if the protocol was available, False otherwise.
+    """
+    if not HAVE_WLR_OUTPUT_POWER:
+        return False
+
+    manager = globals_.get("output_power_manager")
+    if not manager:
+        LOG.debug(
+            "zwlr_output_power_manager_v1 not advertised by compositor; "
+            "will activate automatically if KDE adds support"
+        )
+        return False
+
+    outputs = globals_.get("outputs", [])
+    for output in outputs:
+        _bind_output_power(manager, output, dispatch)
+
+    LOG.info(
+        "Subscribed to zwlr-output-power-management-v1 (%d output(s))",
+        len(outputs),
+    )
+    return True
+
+
+def _bind_output_power(manager, output, dispatch) -> None:
+    """
+    Bind a zwlr_output_power_v1 object for a single wl_output and register
+    a mode change handler.
+
+    Calls dispatch() when an output transitions from off to on, indicating
+    the display has been powered back on.
+    """
+    power = manager.get_output_power(output)
+    prev_mode = {"value": None}
+
+    def on_mode(power, mode):
+        LOG.debug(
+            "zwlr-output-power: mode %s -> %d",
+            prev_mode["value"],
+            mode,
+        )
+        if (
+            prev_mode["value"] == WLR_OUTPUT_POWER_MODE_OFF
+            and mode == WLR_OUTPUT_POWER_MODE_ON
+        ):
+            dispatch("zwlr-output-power-management-v1:mode-on")
+        prev_mode["value"] = mode
+
+    def on_failed(power):
+        LOG.warning(
+            "zwlr-output-power: output power management unavailable for this output"
+        )
+
+    power.dispatcher["mode"] = on_mode
+    power.dispatcher["failed"] = on_failed
+
+
+# ---------------------------------------------------------------------------
+# Wayland event loop
+# ---------------------------------------------------------------------------
+
+
+def run_wayland_loop(dispatch, idle_timeout_msec: int) -> None:
+    """
+    Connect to the Wayland compositor and monitor for display wake events.
+
+    Reconnects automatically on compositor disconnect.  Runs until the
+    process exits.
+    """
     wayland_display = os.getenv("WAYLAND_DISPLAY")
     if not wayland_display:
-        LOG.warning(
-            "WAYLAND_DISPLAY is not set; Wayland idle monitoring disabled. "
-            "Add 'Environment=WAYLAND_DISPLAY=wayland-0' to the systemd service unit "
-            "or set it in the EnvironmentFile."
+        LOG.error(
+            "WAYLAND_DISPLAY is not set. "
+            "Add 'Environment=WAYLAND_DISPLAY=wayland-0' to the systemd "
+            "service unit or EnvironmentFile."
         )
         return
 
-    def _run_loop():
-        while True:
-            display = WaylandDisplay()
-            try:
-                display.connect()
-            except Exception as exc:
-                LOG.error(
-                    "Cannot connect to Wayland display %s: %s — retrying in %ds",
-                    wayland_display,
-                    exc,
-                    WAYLAND_RECONNECT_DELAY_SEC,
-                )
-                time.sleep(WAYLAND_RECONNECT_DELAY_SEC)
-                continue
+    while True:
+        _run_wayland_connection(dispatch, idle_timeout_msec, wayland_display)
+        LOG.info("Reconnecting in %ds...", WAYLAND_RECONNECT_DELAY_SEC)
+        time.sleep(WAYLAND_RECONNECT_DELAY_SEC)
 
-            registry = display.get_registry()
-            globals_ = {}
 
-            def on_global(registry, name, interface, version):
-                if interface == "ext_idle_notifier_v1":
-                    globals_["notifier"] = registry.bind(
-                        name, ExtIdleNotifierV1, version
-                    )
-                elif interface == "wl_seat":
-                    globals_["seat"] = registry.bind(name, WlSeat, version)
+def _run_wayland_connection(
+    dispatch, idle_timeout_msec: int, wayland_display: str
+) -> None:
+    """
+    Run one Wayland connection lifetime: connect, bind protocols, event loop.
 
-            registry.dispatcher["global"] = on_global
+    Returns normally when the connection drops.  All exceptions are caught
+    and logged so the outer reconnect loop continues cleanly.
+    """
+    display = WaylandDisplay()
+    try:
+        display.connect()
+    except Exception as exc:
+        LOG.error("Cannot connect to Wayland display %s: %s", wayland_display, exc)
+        return
 
-            display.roundtrip()
+    try:
+        _bind_and_run(display, dispatch, idle_timeout_msec)
+    except Exception as exc:
+        LOG.warning("Wayland connection error: %s", exc)
+    finally:
+        display.disconnect()
 
-            notifier = globals_.get("notifier")
-            seat = globals_.get("seat")
 
-            if not notifier or not seat:
-                LOG.error(
-                    "ext_idle_notifier_v1 or wl_seat not advertised by compositor. "
-                    "Wayland idle monitoring unavailable."
-                )
-                display.disconnect()
-                return  # No point retrying; compositor doesn't support the protocol.
+def _bind_and_run(display, dispatch, idle_timeout_msec: int) -> None:
+    """
+    Discover available protocols, bind handlers, and run the event loop.
+    """
+    registry = display.get_registry()
+    globals_ = {}
 
-            notification = notifier.get_idle_notification(timeout_msec, seat)
-
-            def on_idled(notification):
-                LOG.debug("Wayland: idled (display powered off)")
-
-            def on_resumed(notification):
-                LOG.debug("Wayland: resumed (user activity detected)")
-                dispatch("wayland:ext-idle-notify-v1")
-
-            notification.dispatcher["idled"] = on_idled
-            notification.dispatcher["resumed"] = on_resumed
-
-            display.roundtrip()
-            LOG.info(
-                "Subscribed to ext-idle-notify-v1 on %s (timeout %dms)",
-                wayland_display,
-                timeout_msec,
+    def on_global(registry, name, interface, version):
+        if interface == "ext_idle_notifier_v1":
+            globals_["idle_notifier"] = registry.bind(
+                name, ExtIdleNotifierV1, version
+            )
+        elif interface == "wl_seat":
+            globals_["seat"] = registry.bind(name, WlSeat, version)
+        elif interface == "wl_output":
+            from pywayland.protocol.wayland import WlOutput
+            outputs = globals_.setdefault("outputs", [])
+            outputs.append(registry.bind(name, WlOutput, version))
+        elif interface == "zwlr_output_power_manager_v1" and HAVE_WLR_OUTPUT_POWER:
+            globals_["output_power_manager"] = registry.bind(
+                name, ZwlrOutputPowerManagerV1, version
             )
 
-            try:
-                while True:
-                    display.flush()
-                    if display.dispatch(block=True) == -1:
-                        LOG.warning(
-                            "Wayland display.dispatch() returned -1; "
-                            "reconnecting in %ds",
-                            WAYLAND_RECONNECT_DELAY_SEC,
-                        )
-                        break
-            except Exception as exc:
-                LOG.warning(
-                    "Wayland event loop error: %s; reconnecting in %ds",
-                    exc,
-                    WAYLAND_RECONNECT_DELAY_SEC,
-                )
-            finally:
-                display.disconnect()
+    registry.dispatcher["global"] = on_global
+    display.roundtrip()
 
-            time.sleep(WAYLAND_RECONNECT_DELAY_SEC)
+    active_sources = []
 
-    threading.Thread(
-        target=_run_loop,
-        daemon=True,
-        name="wayland-idle",
-    ).start()
+    if _setup_idle_notify(globals_, idle_timeout_msec, dispatch):
+        active_sources.append("ext-idle-notify-v1")
+
+    if _setup_output_power(globals_, dispatch):
+        active_sources.append("zwlr-output-power-management-v1")
+
+    if not active_sources:
+        LOG.error(
+            "No Wayland wake sources available. "
+            "Ensure KWin is running and WAYLAND_DISPLAY is correct."
+        )
+        return
+
+    LOG.info("Active Wayland wake sources: %s", active_sources)
+    display.roundtrip()
+
+    try:
+        while display.dispatch(block=True) != -1:
+            pass
+        LOG.warning("Compositor disconnected")
+    except Exception as exc:
+        LOG.warning("Wayland event loop error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -557,26 +549,242 @@ def subscribe_wayland_idle(dispatch, timeout_msec: int) -> None:
 
 def setup_watchdog() -> None:
     """
-    If systemd watchdog is enabled, schedule periodic WATCHDOG=1
-    notifications at half the configured interval.
+    If systemd watchdog is enabled, start a thread that sends WATCHDOG=1
+    at half the configured interval.
+
+    Uses a plain thread rather than GLib.timeout_add; the daemon has no
+    GLib dependency.
     """
     watchdog_usec = os.getenv("WATCHDOG_USEC")
     if not watchdog_usec:
         return
 
     interval_sec = int(watchdog_usec) / 2_000_000
-    interval_ms = int(interval_sec * 1000)
     LOG.info("Systemd watchdog enabled (ping interval %.1fs)", interval_sec)
 
-    def ping():
-        sd_notify("WATCHDOG=1")
-        return True
+    def _ping_loop():
+        while True:
+            time.sleep(interval_sec)
+            sd_notify("WATCHDOG=1")
 
-    GLib.timeout_add(interval_ms, ping)
+    threading.Thread(
+        target=_ping_loop,
+        daemon=True,
+        name="watchdog",
+    ).start()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# DBus signal sources (logind + screensaver)
+# ---------------------------------------------------------------------------
+
+
+def _logind_session_path() -> str:
+    """
+    Return the D-Bus object path for the current logind session.
+
+    Logind encodes the session ID into the path by replacing each character
+    outside [A-Za-z0-9_] with '_' followed by its two-hex-digit ASCII value.
+
+    Raises RuntimeError if XDG_SESSION_ID is not set.
+    """
+    session_id = os.getenv("XDG_SESSION_ID")
+    if not session_id:
+        raise RuntimeError(
+            "XDG_SESSION_ID is not set; logind session monitoring unavailable."
+        )
+
+    encoded = ""
+    for ch in session_id:
+        if ch.isalnum() or ch == "_":
+            encoded += ch
+        else:
+            encoded += f"_{ord(ch):02x}"
+
+    return f"/org/freedesktop/login1/session/{encoded}"
+
+
+def run_dbus_loop(dispatch) -> None:
+    """
+    Subscribe to DBus wake signals and run a GLib main loop in a daemon thread.
+
+    Monitors three signal sources on behalf of wider DE compatibility:
+
+      Screensaver ActiveChanged / SessionIdleChanged (session bus)
+        Covers screen-lock-based wake events on GNOME, Cinnamon, and KDE
+        when the screen locker is active.
+
+      logind IdleHint PropertiesChanged (system bus)
+        Covers idle resume on X11 sessions and compositors that report
+        idle state to logind.  On KDE 6.x Wayland, IdleHint never
+        transitions; the Wayland path handles that configuration.
+
+      logind PrepareForSleep (system bus)
+        Covers system resume from suspend.  A short delay is inserted
+        before dispatching to allow the display and CEC adapter to
+        re-initialise after suspend.
+
+    GLib main loop is isolated to this thread.  The Wayland event loop
+    and main thread are unaffected if this thread fails to start.
+    """
+    if not HAVE_DBUS:
+        LOG.warning(
+            "python3-dbus or python3-gobject not available; "
+            "DBus wake sources (screensaver, logind) disabled. "
+            "Install python3-dbus and python3-gobject to enable."
+        )
+        return
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+    active_sources = []
+
+    try:
+        session_bus = dbus.SessionBus()
+        _subscribe_screensaver(session_bus, dispatch)
+        active_sources.append("screensaver")
+    except dbus.DBusException as exc:
+        LOG.warning("Cannot connect to session bus: %s", exc)
+
+    try:
+        system_bus = dbus.SystemBus()
+        _subscribe_logind_idle(system_bus, dispatch)
+        _subscribe_prepare_for_sleep(system_bus, dispatch)
+        active_sources.append("logind")
+    except dbus.DBusException as exc:
+        LOG.warning("Cannot connect to system bus: %s", exc)
+
+    if not active_sources:
+        LOG.warning("No DBus wake sources could be subscribed")
+        return
+
+    LOG.info("Active DBus wake sources: %s", active_sources)
+
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except Exception as exc:
+        LOG.warning("DBus GLib main loop exited: %s", exc)
+
+
+def _subscribe_screensaver(session_bus, dispatch) -> None:
+    """
+    Register ActiveChanged and SessionIdleChanged receivers for all known
+    screensaver interfaces on the session bus.
+
+    add_signal_receiver() is a local registration that cannot fail for a
+    missing remote service; all interfaces are always registered.
+    """
+    def make_active_handler(iface):
+        def handler(is_active):
+            LOG.debug("ActiveChanged: is_active=%s iface=%s", is_active, iface)
+            if not is_active:
+                dispatch(f"{iface}:ActiveChanged")
+        return handler
+
+    def make_idle_handler(iface):
+        def handler(is_idle):
+            LOG.debug("SessionIdleChanged: is_idle=%s iface=%s", is_idle, iface)
+            if not is_idle:
+                dispatch(f"{iface}:SessionIdleChanged")
+        return handler
+
+    for iface in SCREENSAVER_INTERFACES:
+        session_bus.add_signal_receiver(
+            make_active_handler(iface),
+            signal_name="ActiveChanged",
+            dbus_interface=iface,
+        )
+        session_bus.add_signal_receiver(
+            make_idle_handler(iface),
+            signal_name="SessionIdleChanged",
+            dbus_interface=iface,
+        )
+        LOG.debug("Subscribed to %s ActiveChanged + SessionIdleChanged", iface)
+
+
+def _subscribe_logind_idle(system_bus, dispatch) -> None:
+    """
+    Subscribe to logind Session PropertiesChanged to detect IdleHint
+    True -> False transitions (session resumed from idle).
+
+    Seeds the initial IdleHint state at subscription time so a daemon
+    restart mid-idle correctly tracks the first True -> False transition.
+    """
+    try:
+        session_path = _logind_session_path()
+    except RuntimeError as exc:
+        LOG.warning("Logind idle monitoring unavailable: %s", exc)
+        return
+
+    prev_idle = {"value": None}
+
+    try:
+        obj = system_bus.get_object(LOGIND_BUS_NAME, session_path)
+        props = dbus.Interface(obj, DBUS_PROPS_IFACE)
+        prev_idle["value"] = bool(props.Get(LOGIND_SESSION_IFACE, "IdleHint"))
+        LOG.debug("Initial logind IdleHint: %s", prev_idle["value"])
+    except dbus.DBusException as exc:
+        LOG.warning("Could not read initial IdleHint: %s", exc)
+
+    def on_properties_changed(iface, changed, invalidated):
+        if iface != LOGIND_SESSION_IFACE:
+            return
+        if "IdleHint" not in changed:
+            return
+        idle_now = bool(changed["IdleHint"])
+        LOG.debug("logind IdleHint: %s -> %s", prev_idle["value"], idle_now)
+        if prev_idle["value"] is True and not idle_now:
+            dispatch("logind:IdleHint")
+        prev_idle["value"] = idle_now
+
+    system_bus.add_signal_receiver(
+        on_properties_changed,
+        signal_name="PropertiesChanged",
+        dbus_interface=DBUS_PROPS_IFACE,
+        bus_name=LOGIND_BUS_NAME,
+        path=session_path,
+    )
+    LOG.debug("Subscribed to logind IdleHint on %s", session_path)
+
+
+def _subscribe_prepare_for_sleep(system_bus, dispatch) -> None:
+    """
+    Subscribe to logind PrepareForSleep to detect system resume from suspend.
+
+    PrepareForSleep(True)  = system is about to suspend (no action)
+    PrepareForSleep(False) = system has resumed from suspend
+
+    A short delay is inserted on resume to allow display and CEC adapter
+    re-initialisation before sending commands.
+    """
+    def on_prepare_for_sleep(sleeping):
+        if sleeping:
+            return
+        LOG.debug("logind: PrepareForSleep(False) - system resuming from suspend")
+
+        def _delayed_dispatch():
+            time.sleep(SUSPEND_RESUME_DELAY_SEC)
+            dispatch("logind:PrepareForSleep")
+
+        threading.Thread(
+            target=_delayed_dispatch,
+            daemon=True,
+            name="cec-resume-delay",
+        ).start()
+
+    system_bus.add_signal_receiver(
+        on_prepare_for_sleep,
+        signal_name="PrepareForSleep",
+        dbus_interface=LOGIND_MANAGER_IFACE,
+        bus_name=LOGIND_BUS_NAME,
+        path=LOGIND_MANAGER_PATH,
+    )
+    LOG.debug("Subscribed to logind PrepareForSleep")
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
 # ---------------------------------------------------------------------------
 
 
@@ -584,18 +792,7 @@ def parse_args():
     """
     Parse arguments, with environment variables as defaults.
 
-    Config file format (shell-style key=value):
-
-        # ~/.config/cec-wake/cec-wake.conf
-        CEC_WAKE_HDMI_PORT=3
-        CEC_WAKE_IDLE_TIMEOUT=0
-        CEC_WAKE_WAKE_ON_START=1
-        CEC_WAKE_DEBUG=0
-        CEC_WAKE_OSD_NAME=MyPC
-        # CEC_WAKE_ADAPTER=/dev/cec
-        # CEC_WAKE_DEVICE_TIMEOUT=120
-        # CEC_WAKE_NO_LOGIND=0
-        # CEC_WAKE_NO_WAYLAND=0
+    CLI arguments always take precedence over environment variables.
     """
 
     def _bool_env(key: str) -> bool:
@@ -617,7 +814,8 @@ def parse_args():
         default=os.getenv("CEC_WAKE_ADAPTER", "/dev/cec"),
         metavar="PATH",
         help=(
-            "CEC device path to check for at startup (default: /dev/cec) "
+            "CEC device path to check for at startup (default: /dev/cec). "
+            "Not passed to cec-client; libcec auto-detects the adapter "
             "[env: CEC_WAKE_ADAPTER]"
         ),
     )
@@ -626,7 +824,10 @@ def parse_args():
         type=int,
         default=int(os.getenv("CEC_WAKE_DEVICE_TIMEOUT", "120")),
         metavar="SECONDS",
-        help="Seconds to wait for CEC device at startup (default: 120) [env: CEC_WAKE_DEVICE_TIMEOUT]",
+        help=(
+            "Seconds to wait for CEC device at startup (default: 120) "
+            "[env: CEC_WAKE_DEVICE_TIMEOUT]"
+        ),
     )
     parser.add_argument(
         "--hdmi-port",
@@ -635,46 +836,43 @@ def parse_args():
         metavar="N",
         help=(
             "HDMI port number the PC is connected to (1-15). "
-            "Bypasses DRM-based auto-detection via cec-client -p. "
+            "Sets the CEC physical address via cec-client -p, bypassing "
+            "DRM-based auto-detection which can fail on nvidia systems when "
+            "the GPU enumerates as card1 rather than card0. "
             "If 0, libcec auto-detects (default: 0) [env: CEC_WAKE_HDMI_PORT]"
         ),
     )
     parser.add_argument(
         "--idle-timeout-sec",
         type=int,
-        default=int(os.getenv("CEC_WAKE_IDLE_TIMEOUT", "0")),
+        default=int(os.getenv("CEC_WAKE_IDLE_TIMEOUT", "60")),
         metavar="SECONDS",
         help=(
-            "Override the idle timeout registered with ext-idle-notify-v1, "
-            "in seconds.  Normally auto-detected from ~/.config/powerdevilrc "
-            "(TurnOffDisplayIdleTimeoutSec minus 5s).  Must be strictly less "
-            "than the KDE display power-off timeout or the idled/resumed "
-            "events never fire.  Set to 0 to use auto-detection (default). "
+            "Idle timeout for ext-idle-notify-v1, in seconds (default: 60). "
+            "Must be less than the KDE display power-off setting so that the "
+            "idled event fires before the screen goes dark, arming the "
+            "notification for resumed on wake.  Spurious wakes cannot occur "
+            "because the notification resets after each resumed event. "
             "[env: CEC_WAKE_IDLE_TIMEOUT]"
         ),
-    )
-    parser.add_argument(
-        "--wake-on-start",
-        action="store_true",
-        default=_bool_env("CEC_WAKE_WAKE_ON_START"),
-        help="Send a CEC wake command shortly after startup [env: CEC_WAKE_WAKE_ON_START]",
     )
     parser.add_argument(
         "--osd-name",
         default=os.getenv("CEC_WAKE_OSD_NAME", ""),
         metavar="NAME",
         help=(
-            "OSD name broadcast to the TV via CEC SetOSDName (max 14 chars). "
-            "Omit to use libcec's default [env: CEC_WAKE_OSD_NAME]"
+            "OSD name broadcast to the TV via CEC SetOSDName (max 14 chars, "
+            "ASCII printable).  Purely cosmetic; omit to use libcec's default "
+            "[env: CEC_WAKE_OSD_NAME]"
         ),
     )
     parser.add_argument(
-        "--no-logind",
+        "--wake-on-start",
         action="store_true",
-        default=_bool_env("CEC_WAKE_NO_LOGIND"),
+        default=_bool_env("CEC_WAKE_WAKE_ON_START"),
         help=(
-            "Disable logind IdleHint monitoring (system bus). "
-            "Use if logind causes spurious wakes [env: CEC_WAKE_NO_LOGIND]"
+            "Send a CEC wake command shortly after startup "
+            "[env: CEC_WAKE_WAKE_ON_START]"
         ),
     )
     parser.add_argument(
@@ -682,12 +880,29 @@ def parse_args():
         action="store_true",
         default=_bool_env("CEC_WAKE_NO_WAYLAND"),
         help=(
-            "Disable Wayland ext-idle-notify-v1 monitoring. "
-            "Use if the session is X11 or Wayland monitoring causes issues "
+            "Disable Wayland event sources (ext-idle-notify-v1, "
+            "zwlr-output-power-management-v1). "
+            "Use on X11 sessions or if Wayland monitoring causes issues "
             "[env: CEC_WAKE_NO_WAYLAND]"
         ),
     )
+    parser.add_argument(
+        "--no-dbus",
+        action="store_true",
+        default=_bool_env("CEC_WAKE_NO_DBUS"),
+        help=(
+            "Disable DBus event sources (screensaver, logind IdleHint, "
+            "PrepareForSleep). "
+            "Use if DBus monitoring causes spurious wakes "
+            "[env: CEC_WAKE_NO_DBUS]"
+        ),
+    )
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -708,16 +923,15 @@ def main():
 
     LOG.info(
         "Starting cec-wake-daemon (adapter=%s, hdmi-port=%s, osd-name=%s, "
-        "idle-timeout=%s, logind=%s, wayland=%s)",
+        "idle-timeout=%ds, wayland=%s, dbus=%s, wlr-output-power=%s)",
         args.adapter,
         args.hdmi_port or "auto",
         args.osd_name or "(libcec default)",
-        f"{args.idle_timeout_sec}s (override)" if args.idle_timeout_sec else "auto",
-        "disabled" if args.no_logind else "enabled",
+        args.idle_timeout_sec,
         "disabled" if args.no_wayland else "enabled",
+        "disabled" if args.no_dbus else "enabled",
+        "available" if HAVE_WLR_OUTPUT_POWER else "not in pywayland (will activate if KDE adds support)",
     )
-
-    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
     try:
         wait_for_device(args.adapter, args.device_timeout)
@@ -726,59 +940,23 @@ def main():
         sd_notify("STOPPING=1")
         sys.exit(1)
 
-    try:
-        session_bus = dbus.SessionBus()
-    except dbus.DBusException as exc:
-        LOG.error("Cannot connect to session bus: %s", exc)
-        sd_notify("STOPPING=1")
-        sys.exit(1)
-
     dispatch = build_wake_dispatcher(args.hdmi_port, args.osd_name)
 
-    subscribed = subscribe_screensaver_signals(session_bus, dispatch)
-    LOG.info("Monitoring screensaver interfaces: %s", subscribed)
-
     if not args.no_wayland:
-        if args.idle_timeout_sec:
-            effective_timeout_sec = args.idle_timeout_sec
-            LOG.info("Using --idle-timeout-sec override: %ds", effective_timeout_sec)
-        else:
-            kde_timeout = kde_screen_off_timeout_sec()
-            if kde_timeout is not None:
-                effective_timeout_sec = max(1, kde_timeout - 5)
-                LOG.info(
-                    "KDE screen-off timeout: %ds, using idle-notify timeout: %ds",
-                    kde_timeout,
-                    effective_timeout_sec,
-                )
-            else:
-                LOG.warning(
-                    "Could not read KDE screen-off timeout from ~/.config/powerdevilrc; "
-                    "set --idle-timeout-sec explicitly or set CEC_WAKE_IDLE_TIMEOUT. "
-                    "Wayland idle monitoring disabled."
-                )
-                effective_timeout_sec = 0
+        threading.Thread(
+            target=run_wayland_loop,
+            args=(dispatch, args.idle_timeout_sec * 1000),
+            daemon=True,
+            name="wayland-loop",
+        ).start()
 
-        if effective_timeout_sec:
-            subscribe_wayland_idle(dispatch, effective_timeout_sec * 1000)
-
-    if not args.no_logind:
-        try:
-            session_path = logind_session_path()
-            system_bus = dbus.SystemBus()
-            subscribe_logind_idle(system_bus, session_path, dispatch)
-        except RuntimeError as exc:
-            LOG.warning("Logind monitoring unavailable: %s", exc)
-        except dbus.DBusException as exc:
-            LOG.warning("Cannot connect to system bus for logind monitoring: %s", exc)
-
-    loop = GLib.MainLoop()
-
-    def on_sigterm(_signum, _frame):
-        LOG.info("Received SIGTERM, shutting down")
-        loop.quit()
-
-    signal.signal(signal.SIGTERM, on_sigterm)
+    if not args.no_dbus:
+        threading.Thread(
+            target=run_dbus_loop,
+            args=(dispatch,),
+            daemon=True,
+            name="dbus-loop",
+        ).start()
 
     setup_watchdog()
     sd_notify("READY=1")
@@ -792,8 +970,16 @@ def main():
             name="cec-wake-init",
         ).start()
 
+    stop = threading.Event()
+
+    def on_sigterm(_signum, _frame):
+        LOG.info("Received SIGTERM, shutting down")
+        stop.set()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
     try:
-        loop.run()
+        stop.wait()
     except KeyboardInterrupt:
         LOG.info("Interrupted, exiting")
     finally:
