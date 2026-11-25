@@ -1,10 +1,11 @@
 """Tests for the single-flight wake dispatcher."""
 
-import threading
+from __future__ import annotations
 
+import threading
 from unittest.mock import patch
 
-import cec_wake_daemon as cec
+from cec_wake import dispatcher as dispatcher_mod
 
 
 def test_dispatch_runs_worker_once():
@@ -13,13 +14,13 @@ def test_dispatch_runs_worker_once():
     started = threading.Event()
     release = threading.Event()
 
-    def fake_wake(*args, **kwargs):
+    def fake_wake(*_args, **_kwargs):
         calls.append(1)
         started.set()
         release.wait(3)
 
-    with patch.object(cec, "run_cec_wake", side_effect=fake_wake):
-        dispatch = cec.build_wake_dispatcher()
+    with patch.object(dispatcher_mod, "run_cec_wake", side_effect=fake_wake):
+        dispatch = dispatcher_mod.build_wake_dispatcher()
         dispatch("source")
         assert started.wait(2), "worker thread never started"
         release.set()
@@ -36,13 +37,13 @@ def test_dispatch_drops_event_while_in_flight():
     started = threading.Event()
     release = threading.Event()
 
-    def fake_wake(*args, **kwargs):
+    def fake_wake(*_args, **_kwargs):
         calls.append(1)
         started.set()
         release.wait(3)
 
-    with patch.object(cec, "run_cec_wake", side_effect=fake_wake):
-        dispatch = cec.build_wake_dispatcher()
+    with patch.object(dispatcher_mod, "run_cec_wake", side_effect=fake_wake):
+        dispatch = dispatcher_mod.build_wake_dispatcher()
         dispatch("source-a")
         assert started.wait(2), "worker thread never started"
         # Lock is held by the in-flight worker; this must be dropped.

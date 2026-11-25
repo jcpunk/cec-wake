@@ -1,11 +1,12 @@
 """Tests for cec-client invocation and the wake command builder."""
 
+from __future__ import annotations
+
 import signal
 import subprocess
-
 from unittest.mock import Mock, patch
 
-import cec_wake_daemon as cec
+from cec_wake import cec
 
 
 def test_run_cec_cmd_success():
@@ -68,7 +69,10 @@ def test_run_cec_wake_includes_port_and_name():
 
     with patch.object(cec, "_run_cec_cmd", side_effect=capture):
         cec.run_cec_wake(hdmi_port=2, osd_name="PC")
-    assert "-p" in cmd and "2" in cmd and "-o" in cmd and "PC" in cmd
+    assert "-p" in cmd
+    assert "2" in cmd
+    assert "-o" in cmd
+    assert "PC" in cmd
 
 
 def test_run_cec_wake_sends_power_then_active_source():

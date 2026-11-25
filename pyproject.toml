@@ -18,10 +18,22 @@ dev = [
   "ruff>=0.15.9",
 ]
 
+[tool.mypy]
+files = "src"
+ignore_missing_imports = true
+no_implicit_optional = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src -ra"
+
 [tool.coverage.run]
 source = ["src"]
 branch = true
-omit = ["tests/**"]
+omit = ["tests/**", "src/cec_wake/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
@@ -34,15 +46,6 @@ exclude_lines = [
   "if TYPE_CHECKING:",
   "@abstractmethod",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "--cov=src -ra"
-
-[tool.mypy]
-ignore_missing_imports = true
-no_implicit_optional = true
-show_error_codes = true
 
 [tool.ruff]
 fix = true
@@ -85,7 +88,10 @@ ignore = [
 "tests/**" = [
   "ARG001",  # fixture args used for side-effects only are intentionally unused
   "ARG002",  # same as ARG001 for method arguments in test classes
+  "ARG005",  # lambda args matching a real/mocked signature are often unused
   "E501",    # line too long -- test readability trumps line length
+  "FBT003",  # booleans passed positionally mirror real DBus signal payloads
+  "N818",    # local sentinel exceptions in tests need no Error suffix
   "S101",    # test cases use assert
   "PLR2004", # magic values -- expected counts are intentional literals in tests
   "PLC0415", # imports not at top level -- fixture-scoped imports are intentional

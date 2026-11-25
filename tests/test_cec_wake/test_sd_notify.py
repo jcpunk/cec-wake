@@ -1,21 +1,22 @@
 """Tests for the inline systemd sd_notify helper."""
 
+from __future__ import annotations
+
 import socket
 
-import cec_wake_daemon as cec
+from cec_wake import sd_notify as sd_notify_mod
 
 
 def test_sd_notify_no_socket_is_noop(monkeypatch):
     """Without NOTIFY_SOCKET the notify is a silent no-op."""
     monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
-    # Must not raise regardless of environment.
-    cec.sd_notify("READY=1")
+    sd_notify_mod.sd_notify("READY=1")  # must not raise
 
 
 def test_sd_notify_bad_path_is_silenced(monkeypatch, tmp_path):
     """A socket path that cannot be connected is ignored, not fatal."""
     monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "no-such-socket"))
-    cec.sd_notify("READY=1")  # no exception raised
+    sd_notify_mod.sd_notify("READY=1")  # no exception raised
 
 
 def test_sd_notify_delivers_message(monkeypatch, tmp_path):
@@ -23,5 +24,5 @@ def test_sd_notify_delivers_message(monkeypatch, tmp_path):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(str(tmp_path / "notify"))
     monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "notify"))
-    cec.sd_notify("READY=1")
+    sd_notify_mod.sd_notify("READY=1")
     assert sock.recv(1024) == b"READY=1"

@@ -1,21 +1,23 @@
 """Tests for the systemd watchdog helper."""
 
+from __future__ import annotations
+
 import threading
 
-import cec_wake_daemon as cec
+from cec_wake import watchdog as watchdog_mod
 
 
 def test_setup_watchdog_without_env_returns(monkeypatch):
     """Without WATCHDOG_USEC set the watchdog is a silent no-op."""
     monkeypatch.delenv("WATCHDOG_USEC", raising=False)
-    cec.setup_watchdog()
+    watchdog_mod.setup_watchdog()
 
 
 def test_setup_watchdog_starts_ping_loop(monkeypatch):
     """With WATCHDOG_USEC set, a thread pings systemd at half the interval."""
     monkeypatch.setenv("WATCHDOG_USEC", "4000000")  # interval = 2s
     # Avoid the real 1s sleep keeping the ping thread alive.
-    monkeypatch.setattr(cec.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(watchdog_mod.time, "sleep", lambda *_a, **_k: None)
 
     pings = []
 
@@ -23,7 +25,7 @@ def test_setup_watchdog_starts_ping_loop(monkeypatch):
         pings.append(message)
         raise RuntimeError("stop the ping loop after one ping")
 
-    monkeypatch.setattr(cec, "sd_notify", _send)
+    monkeypatch.setattr(watchdog_mod, "sd_notify", _send)
 
     # The ping loop is an unbounded ``while True``; it only stops by raising.
     # Capture that exception so it is not reported as an unhandled thread error.
@@ -35,7 +37,7 @@ def test_setup_watchdog_starts_ping_loop(monkeypatch):
     old_hook = threading.excepthook
     threading.excepthook = _excepthook
     try:
-        cec.setup_watchdog()
+        watchdog_mod.setup_watchdog()
         for thread in threading.enumerate():
             if thread.name == "watchdog":
                 thread.join(2)

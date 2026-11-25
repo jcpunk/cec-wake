@@ -32,3 +32,4 @@ coverage.xml
 BUILD/*
 RPMS/*
 SRPMS/*
+/cec_wake_daemon

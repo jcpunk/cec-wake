@@ -1,8 +1,8 @@
 """Tests for environment-default argument parsing."""
 
-import sys
+from __future__ import annotations
 
-import cec_wake_daemon as cec
+from cec_wake import config as config_mod
 
 _ENV_KEYS = (
     "CEC_WAKE_DEBUG",
@@ -26,33 +26,30 @@ def _clean_env(monkeypatch):
 def test_parse_args_defaults(monkeypatch):
     """All flags default to the documented built-in values."""
     _clean_env(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["prog"])
-    args = cec.parse_args()
-    assert args.debug is False
-    assert args.adapter == "/dev/cec"
-    assert args.device_timeout == 120
-    assert args.hdmi_port == 0
-    assert args.idle_timeout_sec == 60
-    assert args.osd_name == ""
-    assert args.wake_on_start is False
-    assert args.no_wayland is False
-    assert args.no_dbus is False
+    config = config_mod.parse_args([])
+    assert config.debug is False
+    assert config.adapter == "/dev/cec"
+    assert config.device_timeout == 120
+    assert config.hdmi_port == 0
+    assert config.idle_timeout_sec == 60
+    assert config.osd_name == ""
+    assert config.wake_on_start is False
+    assert config.no_wayland is False
+    assert config.no_dbus is False
 
 
 def test_parse_args_bool_env(monkeypatch):
     """A CEC_WAKE_DEBUG=1 env var turns the flag on."""
     _clean_env(monkeypatch)
     monkeypatch.setenv("CEC_WAKE_DEBUG", "1")
-    monkeypatch.setattr(sys, "argv", ["prog"])
-    assert cec.parse_args().debug is True
+    assert config_mod.parse_args([]).debug is True
 
 
 def test_parse_args_int_env(monkeypatch):
     """An integer env var is parsed as int."""
     _clean_env(monkeypatch)
     monkeypatch.setenv("CEC_WAKE_IDLE_TIMEOUT", "30")
-    monkeypatch.setattr(sys, "argv", ["prog"])
-    assert cec.parse_args().idle_timeout_sec == 30
+    assert config_mod.parse_args([]).idle_timeout_sec == 30
 
 
 def test_parse_args_bool_env_variants(monkeypatch):
@@ -60,10 +57,9 @@ def test_parse_args_bool_env_variants(monkeypatch):
     _clean_env(monkeypatch)
     monkeypatch.setenv("CEC_WAKE_NO_WAYLAND", "true")
     monkeypatch.setenv("CEC_WAKE_NO_DBUS", "yes")
-    monkeypatch.setattr(sys, "argv", ["prog"])
-    args = cec.parse_args()
-    assert args.no_wayland is True
-    assert args.no_dbus is True
+    config = config_mod.parse_args([])
+    assert config.no_wayland is True
+    assert config.no_dbus is True
 
 
 def test_parse_args_cli_overrides_env(monkeypatch):
@@ -71,21 +67,16 @@ def test_parse_args_cli_overrides_env(monkeypatch):
     _clean_env(monkeypatch)
     monkeypatch.setenv("CEC_WAKE_DEBUG", "0")
     monkeypatch.setenv("CEC_WAKE_ADAPTER", "/dev/env")
-    monkeypatch.setattr(
-        sys, "argv", ["prog", "--debug", "--adapter", "/dev/cli"]
-    )
-    args = cec.parse_args()
-    assert args.debug is True
-    assert args.adapter == "/dev/cli"
+    config = config_mod.parse_args(["--debug", "--adapter", "/dev/cli"])
+    assert config.debug is True
+    assert config.adapter == "/dev/cli"
 
 
-def test_parse_args_int_flags(monkeypatch):
+def test_parse_args_int_flags():
     """Integer flags parse from the command line."""
-    monkeypatch.setattr(
-        sys, "argv",
-        ["prog", "--device-timeout", "5", "--hdmi-port", "3", "--osd-name", "PC"],
+    config = config_mod.parse_args(
+        ["--device-timeout", "5", "--hdmi-port", "3", "--osd-name", "PC"]
     )
-    args = cec.parse_args()
-    assert args.device_timeout == 5
-    assert args.hdmi_port == 3
-    assert args.osd_name == "PC"
+    assert config.device_timeout == 5
+    assert config.hdmi_port == 3
+    assert config.osd_name == "PC"

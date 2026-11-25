@@ -1,0 +1,73 @@
+name: CI
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache
+          key: ${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/pre-commit-config.yaml') }}-pre-commit
+          restore-keys: |
+            ${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/pre-commit-config.yaml') }}-
+            ${{ runner.os }}-
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: pip install uv
+      - run: uv sync --group dev --upgrade
+      - run: uv run pre-commit run --all-files
+
+  get-python-version:
+    runs-on: ubuntu-latest
+    needs:
+      - pre-commit
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract minimum Python version from pyproject.toml
+        id: version
+        run: |
+          # Extract requires-python value and get minimum version
+          # e.g., ">=3.9" becomes "3.9"
+          VERSION=$(grep 'requires-python' pyproject.toml | sed 's/.*>=//' | sed 's/".*//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  pytest:
+    runs-on: ubuntu-latest
+    needs:
+      - pre-commit
+      - get-python-version
+    strategy:
+      matrix:
+        python-version:
+          - ${{ needs.get-python-version.outputs.version }}
+          - "3.x"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache
+          key: ${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/pre-commit-config.yaml') }}-pytest-py${{ matrix.python-version }}
+          restore-keys: |
+            ${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/pre-commit-config.yaml') }}-pytest-
+            ${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/pre-commit-config.yaml') }}-
+            ${{ runner.os }}-
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install uv
+      - run: uv sync --python ${{ matrix.python-version }} --group dev --upgrade
+      - run: uv run --python ${{ matrix.python-version }} pytest

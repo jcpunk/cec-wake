@@ -1,9 +1,29 @@
 # Design and rationale
 
-`src/cec_wake_daemon.py` sends an HDMI-CEC Power-On + Active-Source command when an
+`src/cec_wake/` sends an HDMI-CEC Power-On + Active-Source command when an
 attached display powers back on.  The daemon subscribes to several
 complementary wake-event sources, all of which are optional at runtime.  It
 starts with whatever subset is available and logs which sources are active.
+
+## Module layout
+
+| Module | Responsibility |
+|--------|----------------|
+| `cli.py` | Entry point: startup logging, device wait, thread wiring, SIGTERM/shutdown |
+| `config.py` | CLI/environment-variable parsing into a `Config` dataclass |
+| `cec.py` | `cec-client` invocation (Power-On, Active-Source) |
+| `dispatcher.py` | Single-flight lock shared by every wake source |
+| `wayland.py` | `ext-idle-notify-v1` + `zwlr-output-power-management-v1` |
+| `dbus_sources.py` | Screensaver, logind `IdleHint`, logind `PrepareForSleep` |
+| `device.py` | Wait for the CEC device node to appear and be writable |
+| `watchdog.py` | systemd `WATCHDOG=1` keepalive pings |
+| `sd_notify.py` | Inline `sd_notify` client (no `python3-sdnotify` dependency) |
+| `threads.py` | Shared daemon-thread spawn helper |
+
+Each wake source module (`wayland.py`, `dbus_sources.py`) owns its own
+optional-dependency import guard (`HAVE_WAYLAND`, `HAVE_DBUS`) and degrades to
+a logged warning, independent of the other; `cli.py` only decides whether to
+start each source's thread at all (`--no-wayland`/`--no-dbus`).
 
 ## Wake-event sources
 
@@ -106,3 +126,18 @@ The logind object path for a session is derived from `XDG_SESSION_ID` by
 replacing each character outside `[A-Za-z0-9_]` with `'_'` followed by its
 two-hex-digit ASCII value.  For numeric IDs (the common case) this yields
 `/org/freedesktop/login1/session/_3<digits>` (e.g. session "2" -> "_32").
+
+## Packaging as a zipapp
+
+`cec-wake.spec` builds `src/cec_wake/` into a single-file
+[zipapp](https://docs.python.org/3/library/zipapp.html) (`python3 -m zipapp
+src -m "cec_wake.cli:main" -p "/usr/bin/python3"`) rather than installing it
+into site-packages.
+
+This matters because the same RPM must run unmodified across several
+concurrently supported RHEL/AlmaLinux major versions, each shipping a
+different Python 3 minor version: a zipapp only needs a `/usr/bin/python3` on
+`$PATH` and carries its own module search path inside the archive, so there
+is no site-packages layout, `.dist-info`, or interpreter ABI tag to pin to a
+specific Python minor version. `make zipapp` builds the same artifact for
+local/manual installs; see `Makefile`.
