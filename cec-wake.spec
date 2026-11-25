@@ -34,7 +34,7 @@ true
 
 %install
 # install and rename the script to remove the .py suffix
-install -D -m 0755 cec_wake_daemon.py %{buildroot}/%{_libexecdir}/cec_wake_daemon
+install -D -m 0755 src/cec_wake_daemon.py %{buildroot}/%{_libexecdir}/cec_wake_daemon
 install -D -m 0644 cec-wake.service %{buildroot}/%{_userunitdir}/cec-wake.service
 install -D -m 0644 99-cec.rules %{buildroot}/%{_udevrulesdir}/99-cec.rules
 

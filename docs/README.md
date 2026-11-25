@@ -24,9 +24,9 @@ integrates with `sd_notify` for `Type=notify`-style readiness signalling.
 
 | File | Installed path | Purpose |
 |------|---------------|---------|
-| `cec_wake_daemon.py` | `/usr/libexec/cec_wake_daemon` | Main daemon |
-| `cec-wake.service` | `/usr/lib/systemd/user/cec-wake.service` | Systemd user unit |
-| `99-cec.rules` | `/usr/lib/udev/rules.d/99-cec.rules` | Udev symlink + permissions |
+| `src/cec_wake_daemon.py` | `/usr/libexec/cec_wake_daemon` | Main daemon |
+| `units/cec-wake.service` | `/usr/lib/systemd/user/cec-wake.service` | Systemd user unit |
+| `units/99-cec.rules` | `/usr/lib/udev/rules.d/99-cec.rules` | Udev symlink + permissions |
 | `cec-wake.spec` | — | RPM spec |
 
 ## Requirements
@@ -60,12 +60,12 @@ systemctl --user enable --now cec-wake.service
 ### Manual
 
 ```bash
-install -D -m 0755 cec_wake_daemon.py ~/.local/bin/cec_wake_daemon.py
-install -D -m 0644 cec-wake.service \
+install -D -m 0755 src/cec_wake_daemon.py ~/.local/bin/cec_wake_daemon.py
+install -D -m 0644 units/cec-wake.service \
     ~/.config/systemd/user/cec-wake.service
 
 # Udev rule requires root
-sudo install -D -m 0644 99-cec.rules \
+sudo install -D -m 0644 units/99-cec.rules \
     /usr/lib/udev/rules.d/99-cec.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb

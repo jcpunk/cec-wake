@@ -1,0 +1,93 @@
+[project]
+name = "cec-wake"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+description = "HDMI-CEC wake controller (systemd user service + udev rule)"
+readme = "docs/README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "mypy>=1.20.0",
+  "pre-commit>=4.5.1",
+  "pyupgrade>=25.1.0",
+  "pytest>=9.0.2",
+  "pytest-cov>=6.0.0",
+  "ruff>=0.15.9",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = ["tests/**"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 97
+exclude_lines = [
+  "if __name__ == .__main__.:",
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+  "@abstractmethod",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src -ra"
+
+[tool.mypy]
+ignore_missing_imports = true
+no_implicit_optional = true
+show_error_codes = true
+
+[tool.ruff]
+fix = true
+
+[tool.ruff.lint]
+extend-select = [
+  "A",     # detect shadowed builtins
+  "ARG",   # unused-arguments
+  "B",     # flake8-bugbear
+  "C4",    # incorrect use of comprehensions, dict, list, etc
+  "COM",   # enforce trailing comma rules
+  "E",     # PyCodeStyle errors
+  "F",     # Pyflakes rules
+  "FA",    # require `from __future__ import annotations` when needed
+  "FBT",   # detect boolean traps
+  "G",     # Better usage of built-in logging
+  "I",     # isort - import sorting
+  "ICN",   # use common import conventions
+  "ISC",   # good use of string concatenation
+  "N",     # enforce naming conventions
+  "PL",    # pylint
+  "PTH",   # use pathlib instead of os.path
+  "Q",     # quoting rules
+  "RET",   # good return practices
+  "RUF",   # ruff specific lint rules
+  "S",     # bandit
+  "SIM",   # flake8-simplify
+  "TID",   # tidier imports
+  "TRY",   # tryceratops - exception handling
+  "UP",    # pyupgrade
+  "W",     # PyCodeStyle warnings
+]
+ignore = [
+  "BLE001", # catch-and-log is intentional at connection/loop boundaries
+  "COM812", # de-dupe trailing commas
+  "SIM108", # ternary is ugly
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "ARG001",  # fixture args used for side-effects only are intentionally unused
+  "ARG002",  # same as ARG001 for method arguments in test classes
+  "E501",    # line too long -- test readability trumps line length
+  "S101",    # test cases use assert
+  "PLR2004", # magic values -- expected counts are intentional literals in tests
+  "PLC0415", # imports not at top level -- fixture-scoped imports are intentional
+  "TRY003",  # exception messages in tests are often local
+]

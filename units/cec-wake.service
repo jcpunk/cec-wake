@@ -5,7 +5,11 @@ ConditionPathExists=/dev/cec
 
 [Service]
 Type=notify
-Environment=WAYLAND_DISPLAY=wayland-0
+# The Wayland display name is auto-discovered from $XDG_RUNTIME_DIR at runtime.
+# No manual WAYLAND_DISPLAY is needed.  Pin a specific display only if you
+# must, via a drop-in:  systemctl --user edit cec-wake.service
+#   [Service]
+#   Environment=WAYLAND_DISPLAY=wayland-1
 EnvironmentFile=-%h/.config/cec-wake/cec-wake.conf
 # strip .py following standard behavior
 ExecStart=/usr/libexec/cec_wake_daemon
