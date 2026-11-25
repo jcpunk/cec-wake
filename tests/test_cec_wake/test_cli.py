@@ -34,6 +34,44 @@ def _config(**overrides):
     return Config(**base)
 
 
+def test_enabled_disabled():
+    """The enabled/disabled label mirrors the disabled flag."""
+    assert cli._enabled_disabled(disabled=True) == "disabled"
+    assert cli._enabled_disabled(disabled=False) == "enabled"
+
+
+def test_log_startup_wlr_output_power_available(monkeypatch, caplog):
+    """The startup log reports wlr-output-power as available when present."""
+    monkeypatch.setattr(cli, "HAVE_WLR_OUTPUT_POWER", True)
+    with caplog.at_level("INFO"):
+        cli._log_startup(_config())
+    assert "wlr-output-power=available" in caplog.text
+
+
+def test_log_startup_wlr_output_power_unavailable(monkeypatch, caplog):
+    """The startup log reports wlr-output-power as unavailable when absent."""
+    monkeypatch.setattr(cli, "HAVE_WLR_OUTPUT_POWER", False)
+    with caplog.at_level("INFO"):
+        cli._log_startup(_config())
+    assert "wlr-output-power=not in pywayland" in caplog.text
+
+
+def test_log_startup_debug_level(monkeypatch):
+    """main() selects DEBUG level when config.debug is set."""
+    monkeypatch.setattr(cli.Path, "exists", lambda self: True)
+    monkeypatch.setattr(cli, "parse_args", lambda: _config(debug=True))
+    monkeypatch.setattr(cli, "wait_for_device", Mock())
+    monkeypatch.setattr(cli, "setup_watchdog", Mock())
+    monkeypatch.setattr(cli, "sd_notify", Mock())
+
+    basic_config = Mock()
+    monkeypatch.setattr(cli.logging, "basicConfig", basic_config)
+
+    cli.main(stop=_already_stopped())
+
+    assert basic_config.call_args.kwargs["level"] == cli.logging.DEBUG
+
+
 def test_main_missing_client_exits(monkeypatch):
     """A missing cec-client aborts with exit code 1."""
     monkeypatch.setattr(cli.Path, "exists", lambda self: False)

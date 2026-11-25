@@ -75,10 +75,17 @@ def _logind_session_path() -> str:
             "XDG_SESSION_ID is not set; logind session monitoring unavailable."
         )
 
-    encoded = "".join(
-        ch if ch.isalnum() or ch == "_" else f"_{ord(ch):02x}" for ch in session_id
-    )
-    return f"/org/freedesktop/login1/session/{encoded}"
+    return f"/org/freedesktop/login1/session/{_encode_logind_path_segment(session_id)}"
+
+
+def _encode_logind_path_segment(segment: str) -> str:
+    encoded_chars = []
+    for ch in segment:
+        if ch.isalnum() or ch == "_":
+            encoded_chars.append(ch)
+        else:
+            encoded_chars.append(f"_{ord(ch):02x}")
+    return "".join(encoded_chars)
 
 
 def _subscribe_screensaver(session_bus: Any, dispatch: Dispatch) -> None:

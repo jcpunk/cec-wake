@@ -12,11 +12,17 @@ dependencies = []
 dev = [
   "mypy>=1.20.0",
   "pre-commit>=4.5.1",
-  "pyupgrade>=25.1.0",
   "pytest>=9.0.2",
   "pytest-cov>=6.0.0",
   "ruff>=0.15.9",
 ]
+
+[tool.uv.dependency-groups]
+# The daemon itself supports Python >=3.9 (see requires-python above, needed
+# for the zipapp to run unmodified across RHEL/AlmaLinux major versions).
+# The dev tooling has no such constraint and may require newer Python; scope
+# it separately so uv does not try to solve mypy/pre-commit for Python 3.9.
+dev = { requires-python = ">=3.11" }
 
 [tool.mypy]
 files = "src"
@@ -81,7 +87,6 @@ extend-select = [
 ignore = [
   "BLE001", # catch-and-log is intentional at connection/loop boundaries
   "COM812", # de-dupe trailing commas
-  "SIM108", # ternary is ugly
 ]
 
 [tool.ruff.lint.per-file-ignores]

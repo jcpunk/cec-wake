@@ -133,20 +133,14 @@ def _bind_output_power(manager: Any, output: Any, dispatch: Dispatch) -> None:
     the display has been powered back on.
     """
     power = manager.get_output_power(output)
-    prev_mode: dict[str, int | None] = {"value": None}
+    prev_mode: int | None = None
 
     def on_mode(_power: Any, mode: int) -> None:
-        LOG.debug(
-            "zwlr-output-power: mode %s -> %d",
-            prev_mode["value"],
-            mode,
-        )
-        if (
-            prev_mode["value"] == WLR_OUTPUT_POWER_MODE_OFF
-            and mode == WLR_OUTPUT_POWER_MODE_ON
-        ):
+        nonlocal prev_mode
+        LOG.debug("zwlr-output-power: mode %s -> %d", prev_mode, mode)
+        if prev_mode == WLR_OUTPUT_POWER_MODE_OFF and mode == WLR_OUTPUT_POWER_MODE_ON:
             dispatch("zwlr-output-power-management-v1:mode-on")
-        prev_mode["value"] = mode
+        prev_mode = mode
 
     def on_failed(_power: Any) -> None:
         LOG.warning(

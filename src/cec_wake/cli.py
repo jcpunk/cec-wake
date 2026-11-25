@@ -24,7 +24,17 @@ LOG = logging.getLogger("cec-wake")
 __all__ = ["main"]
 
 
+def _enabled_disabled(*, disabled: bool) -> str:
+    if disabled:
+        return "disabled"
+    return "enabled"
+
+
 def _log_startup(config: Config) -> None:
+    wlr_output_power = "not in pywayland (will activate if KDE adds support)"
+    if HAVE_WLR_OUTPUT_POWER:
+        wlr_output_power = "available"
+
     LOG.info(
         "Starting cec-wake-daemon (adapter=%s, hdmi-port=%s, osd-name=%s, "
         "idle-timeout=%ds, wayland=%s, dbus=%s, wlr-output-power=%s)",
@@ -32,11 +42,9 @@ def _log_startup(config: Config) -> None:
         config.hdmi_port or "auto",
         config.osd_name or "(libcec default)",
         config.idle_timeout_sec,
-        "disabled" if config.no_wayland else "enabled",
-        "disabled" if config.no_dbus else "enabled",
-        "available"
-        if HAVE_WLR_OUTPUT_POWER
-        else "not in pywayland (will activate if KDE adds support)",
+        _enabled_disabled(disabled=config.no_wayland),
+        _enabled_disabled(disabled=config.no_dbus),
+        wlr_output_power,
     )
 
 
@@ -58,8 +66,12 @@ def main(stop: threading.Event | None = None) -> None:
 
     config = parse_args()
 
+    log_level = logging.INFO
+    if config.debug:
+        log_level = logging.DEBUG
+
     logging.basicConfig(
-        level=logging.DEBUG if config.debug else logging.INFO,
+        level=log_level,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stdout,
     )
